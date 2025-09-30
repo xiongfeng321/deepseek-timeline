@@ -1213,6 +1213,17 @@ let pageObserver = null;           // page-level MutationObserver (managed)
 let routeCheckIntervalId = null;   // lightweight href polling fallback
 let routeListenersAttached = false;
 
+// Accept both /c/<id> and nested routes like /g/.../c/<id>
+function isConversationRoute(pathname = location.pathname) {
+  // Split path into segments and ensure there's an independent "c" segment
+  const segs = pathname.split('/').filter(Boolean);
+  const i = segs.indexOf('c');
+  if (i === -1) return false;           // no "c" segment → not a conversation route
+  const slug = segs[i + 1];             // the segment right after "c" must exist
+  // Lightweight validity check: allow letters/digits/_/-
+  return typeof slug === 'string' && slug.length > 0 && /^[A-Za-z0-9_-]+$/.test(slug);
+}
+
 function attachRouteListenersOnce() {
     if (routeListenersAttached) return;
     routeListenersAttached = true;
@@ -1259,11 +1270,11 @@ function handleUrlChange() {
     // Cancel any pending init from previous route
     try { if (initTimerId) { clearTimeout(initTimerId); initTimerId = null; } } catch {}
 
-    if (location.pathname.startsWith('/c/')) {
+    if (isConversationRoute()) {
         // Delay slightly to allow DOM to settle; re-check path before init
         initTimerId = setTimeout(() => {
             initTimerId = null;
-            if (location.pathname.startsWith('/c/')) initializeTimeline();
+            if (isConversationRoute()) initializeTimeline();
         }, 300);
     } else {
         if (timelineManagerInstance) {
@@ -1279,7 +1290,7 @@ function handleUrlChange() {
 
 const initialObserver = new MutationObserver(() => {
     if (document.querySelector('article[data-turn-id]')) {
-        if (location.pathname.startsWith('/c/')) {
+        if (isConversationRoute()) {
             initializeTimeline();
         }
         try { initialObserver.disconnect(); } catch {}
