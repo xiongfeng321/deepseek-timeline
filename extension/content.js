@@ -1,3 +1,17 @@
+/**
+ * ChatGPT Conversation Timeline Manager - v1.8 (Definitive Alignment)
+ *
+ * This is the final, polished version that adheres to the highest UI standards.
+ * It introduces a perfect endpoint-mapping algorithm that ensures the timeline
+ * always feels intuitive and correctly represents the user's conversation journey.
+ *
+ * Key Improvements:
+ * 1.  Perfect Endpoint Mapping: The positioning algorithm is finalized. It now
+ *     maps the first user prompt to 0% and the LAST user prompt to 100%,
+ *     providing a predictable and visually complete navigation map.
+ * 2.  This solves all alignment edge cases for both short and long conversations,
+ *     achieving the "unnoticeable" and "silky smooth" quality of AI Studio.
+ */
 class TimelineManager {
     constructor() {
         this.scrollContainer = null;
@@ -64,6 +78,21 @@ class TimelineManager {
         this.resizeIdleDelay = 140; // ms, settle time before min-gap correction
         
         this.debouncedRecalculateAndRender = this.debounce(this.recalculateAndRenderMarkers, 350);
+
+        // Star/Highlight feature state
+        this.starred = new Set();
+        this.markerMap = new Map();
+        this.conversationId = this.extractConversationIdFromPath(location.pathname);
+        // Long-press gesture state
+        this.longPressDuration = 550; // ms
+        this.longPressMoveTolerance = 6; // px
+        this.longPressTimer = null;
+        this.longPressTriggered = false;
+        this.pressStartPos = null;
+        this.pressTargetDot = null;
+        this.suppressClickUntil = 0;
+        // Cross-tab sync
+        this.onStorage = null;
     }
 
     perfStart(name) {
@@ -88,6 +117,9 @@ class TimelineManager {
         this.injectTimelineUI();
         this.setupEventListeners();
         this.setupObservers();
+        // Load persisted star markers for current conversation
+        this.conversationId = this.extractConversationIdFromPath(location.pathname);
+        this.loadStars();
         // Initial rendering will be triggered by observers; avoid duplicate delayed re-render
     }
     
@@ -229,18 +261,23 @@ class TimelineManager {
         this.contentSpanPx = contentSpan;
 
         // Build markers with normalized position along conversation
+        this.markerMap.clear();
         this.markers = Array.from(userTurnElements).map(el => {
             const offsetFromStart = el.offsetTop - firstTurnOffset;
             let n = offsetFromStart / contentSpan;
             n = Math.max(0, Math.min(1, n));
-            return {
+            const m = {
                 id: el.dataset.turnId,
                 element: el,
                 summary: this.normalizeText(el.textContent || ''),
                 n,
                 baseN: n,
                 dotElement: null,
+                starred: false,
             };
+            try { m.starred = this.starred.has(m.id); } catch {}
+            this.markerMap.set(m.id, m);
+            return m;
         });
         // Bump version after markers are rebuilt to invalidate concurrent passes
         this.markersVersion++;
@@ -364,6 +401,11 @@ class TimelineManager {
         this.onTimelineBarClick = (e) => {
             const dot = e.target.closest('.timeline-dot');
             if (dot) {
+                const now = Date.now();
+                if (now < (this.suppressClickUntil || 0)) {
+                    try { e.preventDefault(); e.stopPropagation(); } catch {}
+                    return;
+                }
                 const targetId = dot.dataset.targetTurnId;
                 const targetElement = this.conversationContainer.querySelector(`article[data-turn-id="${targetId}"]`);
                 if (targetElement) {
@@ -373,6 +415,49 @@ class TimelineManager {
             }
         };
         this.ui.timelineBar.addEventListener('click', this.onTimelineBarClick);
+        // Long-press gesture on dots (delegated on bar)
+        this.onPointerDown = (ev) => {
+            const dot = ev.target.closest?.('.timeline-dot');
+            if (!dot) return;
+            if (typeof ev.button === 'number' && ev.button !== 0) return; // left button only
+            this.cancelLongPress();
+            this.pressTargetDot = dot;
+            this.pressStartPos = { x: ev.clientX, y: ev.clientY };
+            try { dot.classList.add('holding'); } catch {}
+            this.longPressTriggered = false;
+            this.longPressTimer = setTimeout(() => {
+                this.longPressTimer = null;
+                if (!this.pressTargetDot) return;
+                const id = this.pressTargetDot.dataset.targetTurnId;
+                this.toggleStar(id);
+                this.longPressTriggered = true;
+                this.suppressClickUntil = Date.now() + 350;
+                // If tooltip is visible for this dot, refresh immediately to reflect ★ prefix change
+                try { this.refreshTooltipForDot(this.pressTargetDot); } catch {}
+                try { this.pressTargetDot.classList.remove('holding'); } catch {}
+            }, this.longPressDuration);
+        };
+        this.onPointerMove = (ev) => {
+            if (!this.pressTargetDot || !this.pressStartPos) return;
+            const dx = ev.clientX - this.pressStartPos.x;
+            const dy = ev.clientY - this.pressStartPos.y;
+            if ((dx * dx + dy * dy) > (this.longPressMoveTolerance * this.longPressMoveTolerance)) {
+                this.cancelLongPress();
+            }
+        };
+        this.onPointerUp = () => { this.cancelLongPress(); };
+        this.onPointerCancel = () => { this.cancelLongPress(); };
+        this.onPointerLeave = (ev) => {
+            const dot = ev.target.closest?.('.timeline-dot');
+            if (dot && dot === this.pressTargetDot) this.cancelLongPress();
+        };
+        try {
+            this.ui.timelineBar.addEventListener('pointerdown', this.onPointerDown);
+            window.addEventListener('pointermove', this.onPointerMove, { passive: true });
+            window.addEventListener('pointerup', this.onPointerUp, { passive: true });
+            window.addEventListener('pointercancel', this.onPointerCancel, { passive: true });
+            this.ui.timelineBar.addEventListener('pointerleave', this.onPointerLeave);
+        } catch {}
         // Listen to container scroll to keep marker active state in sync
         this.onScroll = () => this.scheduleScrollSync();
         this.scrollContainer.addEventListener('scroll', this.onScroll, { passive: true });
@@ -423,7 +508,11 @@ class TimelineManager {
                     // Re-run T0->T1 to avoid layout during animation
                     const tip = this.ui.tooltip;
                     tip.classList.remove('visible');
-                    const fullText = (activeDot.getAttribute('aria-label') || '').trim();
+                    let fullText = (activeDot.getAttribute('aria-label') || '').trim();
+                    try {
+                        const id = activeDot.dataset.targetTurnId;
+                        if (id && this.starred.has(id)) fullText = `★ ${fullText}`;
+                    } catch {}
                     const p = this.computePlacementInfo(activeDot);
                     const layout = this.truncateToThreeLines(fullText, p.width, true);
                     tip.textContent = layout.text;
@@ -481,6 +570,56 @@ class TimelineManager {
             window.addEventListener('pointerup', this.onSliderUp, { once: true });
         };
         try { this.ui.sliderHandle?.addEventListener('pointerdown', this.onSliderDown); } catch {}
+
+        // Cross-tab star sync via localStorage 'storage' event
+        this.onStorage = (e) => {
+            try {
+                if (!e || e.storageArea !== localStorage) return;
+                const cid = this.conversationId;
+                if (!cid) return;
+                const expectedKey = `chatgptTimelineStars:${cid}`;
+                if (e.key !== expectedKey) return;
+
+                // Parse new star set
+                let nextArr = [];
+                try { nextArr = JSON.parse(e.newValue || '[]') || []; } catch { nextArr = []; }
+                const nextSet = new Set(nextArr.map(x => String(x)));
+
+                // Fast no-op check: if sizes match and all entries exist, skip
+                if (nextSet.size === this.starred.size) {
+                    let same = true;
+                    for (const id of this.starred) { if (!nextSet.has(id)) { same = false; break; } }
+                    if (same) return;
+                }
+
+                // Apply to in-memory set
+                this.starred = nextSet;
+
+                // Update markers and any visible dots
+                for (let i = 0; i < this.markers.length; i++) {
+                    const m = this.markers[i];
+                    const want = this.starred.has(m.id);
+                    if (m.starred !== want) {
+                        m.starred = want;
+                        if (m.dotElement) {
+                            try {
+                                m.dotElement.classList.toggle('starred', m.starred);
+                                m.dotElement.setAttribute('aria-pressed', m.starred ? 'true' : 'false');
+                            } catch {}
+                        }
+                    }
+                }
+
+                // If a tooltip is currently visible over any dot, refresh it to reflect ★
+                try {
+                    if (this.ui.tooltip?.classList.contains('visible')) {
+                        const currentDot = this.ui.timelineBar.querySelector('.timeline-dot:hover, .timeline-dot:focus');
+                        if (currentDot) this.refreshTooltipForDot(currentDot);
+                    }
+                } catch {}
+            } catch {}
+        };
+        try { window.addEventListener('storage', this.onStorage); } catch {}
     }
     
     smoothScrollTo(targetElement, duration = 600) {
@@ -648,7 +787,13 @@ class TimelineManager {
         // T0: compute + write geometry while hidden
         const tip = this.ui.tooltip;
         tip.classList.remove('visible');
-        const fullText = (dot.getAttribute('aria-label') || '').trim();
+        let fullText = (dot.getAttribute('aria-label') || '').trim();
+        try {
+            const id = dot.dataset.targetTurnId;
+            if (id && this.starred.has(id)) {
+                fullText = `★ ${fullText}`;
+            }
+        } catch {}
         const p = this.computePlacementInfo(dot);
         const layout = this.truncateToThreeLines(fullText, p.width, true);
         tip.textContent = layout.text;
@@ -726,6 +871,25 @@ class TimelineManager {
         tip.style.left = `${left}px`;
         tip.style.top = `${top}px`;
         tip.setAttribute('data-placement', placement);
+    }
+
+    // Refresh the currently visible tooltip for a given dot in place (no hide/show flicker)
+    refreshTooltipForDot(dot) {
+        if (!this.ui?.tooltip || !dot) return;
+        const tip = this.ui.tooltip;
+        // Only update when tooltip is currently visible
+        const isVisible = tip.classList.contains('visible');
+        if (!isVisible) return;
+
+        let fullText = (dot.getAttribute('aria-label') || '').trim();
+        try {
+            const id = dot.dataset.targetTurnId;
+            if (id && this.starred.has(id)) fullText = `★ ${fullText}`;
+        } catch {}
+        const p = this.computePlacementInfo(dot);
+        const layout = this.truncateToThreeLines(fullText, p.width, true);
+        tip.textContent = layout.text;
+        this.placeTooltipAt(dot, p.placement, p.width, layout.height);
     }
 
     // --- Long-canvas geometry and virtualization (Linked mode) ---
@@ -856,6 +1020,11 @@ class TimelineManager {
                 }
                 // Apply active state immediately if this is the active marker
                 try { dot.classList.toggle('active', marker.id === this.activeTurnId); } catch {}
+                // Apply starred state and aria
+                try {
+                    dot.classList.toggle('starred', !!marker.starred);
+                    dot.setAttribute('aria-pressed', marker.starred ? 'true' : 'false');
+                } catch {}
                 marker.dotElement = dot;
                 frag.appendChild(dot);
             } else {
@@ -863,6 +1032,10 @@ class TimelineManager {
                 if (this.usePixelTop) {
                     marker.dotElement.style.top = `${Math.round(this.yPositions[i])}px`;
                 }
+                try {
+                    marker.dotElement.classList.toggle('starred', !!marker.starred);
+                    marker.dotElement.setAttribute('aria-pressed', marker.starred ? 'true' : 'false');
+                } catch {}
             }
         }
         if (localVersion !== this.markersVersion) return; // stale pass, abort
@@ -1123,6 +1296,12 @@ class TimelineManager {
         if (this.ui.timelineBar && this.onTimelineBarClick) {
             try { this.ui.timelineBar.removeEventListener('click', this.onTimelineBarClick); } catch {}
         }
+        try { window.removeEventListener('storage', this.onStorage); } catch {}
+        try { this.ui.timelineBar?.removeEventListener('pointerdown', this.onPointerDown); } catch {}
+        try { window.removeEventListener('pointermove', this.onPointerMove); } catch {}
+        try { window.removeEventListener('pointerup', this.onPointerUp); } catch {}
+        try { window.removeEventListener('pointercancel', this.onPointerCancel); } catch {}
+        try { this.ui.timelineBar?.removeEventListener('pointerleave', this.onPointerLeave); } catch {}
         if (this.scrollContainer && this.onScroll) {
             try { this.scrollContainer.removeEventListener('scroll', this.onScroll); } catch {}
         }
@@ -1201,6 +1380,63 @@ class TimelineManager {
         } catch {}
         if (this.sliderFadeTimer) { try { clearTimeout(this.sliderFadeTimer); } catch {} this.sliderFadeTimer = null; }
         this.pendingActiveId = null;
+    }
+
+    // --- Star/Highlight helpers ---
+    extractConversationIdFromPath(pathname = location.pathname) {
+        try {
+            const segs = String(pathname || '').split('/').filter(Boolean);
+            const i = segs.indexOf('c');
+            if (i === -1) return null;
+            const slug = segs[i + 1];
+            if (slug && /^[A-Za-z0-9_-]+$/.test(slug)) return slug;
+            return null;
+        } catch { return null; }
+    }
+
+    loadStars() {
+        this.starred.clear();
+        const cid = this.conversationId;
+        if (!cid) return;
+        try {
+            const raw = localStorage.getItem(`chatgptTimelineStars:${cid}`);
+            if (!raw) return;
+            const arr = JSON.parse(raw);
+            if (Array.isArray(arr)) arr.forEach(id => this.starred.add(String(id)));
+        } catch {}
+    }
+
+    saveStars() {
+        const cid = this.conversationId;
+        if (!cid) return;
+        try { localStorage.setItem(`chatgptTimelineStars:${cid}`, JSON.stringify(Array.from(this.starred))); } catch {}
+    }
+
+    toggleStar(turnId) {
+        const id = String(turnId || '');
+        if (!id) return;
+        if (this.starred.has(id)) this.starred.delete(id); else this.starred.add(id);
+        this.saveStars();
+        const m = this.markerMap.get(id);
+        if (m) {
+            m.starred = this.starred.has(id);
+            if (m.dotElement) {
+                try {
+                    m.dotElement.classList.toggle('starred', m.starred);
+                    m.dotElement.setAttribute('aria-pressed', m.starred ? 'true' : 'false');
+                } catch {}
+                // If tooltip is visible and anchored to this dot, update immediately
+                try { this.refreshTooltipForDot(m.dotElement); } catch {}
+            }
+        }
+    }
+
+    cancelLongPress() {
+        if (this.longPressTimer) { try { clearTimeout(this.longPressTimer); } catch {} this.longPressTimer = null; }
+        if (this.pressTargetDot) { try { this.pressTargetDot.classList.remove('holding'); } catch {} }
+        this.pressTargetDot = null;
+        this.pressStartPos = null;
+        this.longPressTriggered = false;
     }
 }
 

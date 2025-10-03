@@ -14,6 +14,7 @@ This extension adds an interactive timeline bar to your ChatGPT conversation pag
 
 - 📍 Clickable markers for each user message  
 - 🧭 Instantly jump to any point in the conversation  
+- ⭐ Long-press a message to star it, and see it highlighted on the timeline (stars are saved in localStorage, so they persist even after refresh)  
 - 🌗 Auto-adapts to ChatGPT's light/dark theme  
 
 ---

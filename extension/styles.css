@@ -1,6 +1,13 @@
+/*
+  ChatGPT Timeline Stylesheet
+  This CSS is designed to be resilient and adapt to ChatGPT's light/dark themes.
+*/
+
+/* Use CSS variables for easy theme management. We sample ChatGPT's own colors. */
 :root {
     --timeline-dot-color: #D1D5DB; /* Light mode gray */
     --timeline-dot-active-color: #10A37F; /* ChatGPT's primary green */
+    --timeline-star-color: #F59E0B; /* amber-500 for starred */
 
     /* AI Studio-like tooltip tokens (light) */
     --timeline-tooltip-bg: #FFFFFF;
@@ -29,12 +36,14 @@
     /* spacing model */
     --timeline-tooltip-gap-visual: 8px;  /* arrow tip to dot */
     --timeline-tooltip-gap-box: 4px;     /* rectangle edge to timeline */
+    --timeline-hold-ms: 550ms; /* long-press duration */
 }
 
 /* Override variables when ChatGPT's dark mode is active */
 html.dark {
     --timeline-dot-color: #555555;
     --timeline-dot-active-color: #19C37D;
+    --timeline-star-color: #F59E0B;
     /* Dark tooltip palette */
     --timeline-tooltip-bg: #2B2B2B;
     --timeline-tooltip-text: #EAEAEA;
@@ -129,6 +138,32 @@ html.dark {
 /* Style for the currently active dot */
 .timeline-dot.active::after {
     box-shadow: 0 0 0 var(--timeline-active-ring) var(--timeline-dot-active-color), 0 0 6px var(--timeline-dot-active-color);
+}
+
+/* Starred state: filled with star color */
+.timeline-dot.starred::after {
+    background-color: var(--timeline-star-color);
+}
+
+/* Long-press visual: subtle ring fade-in (progress surrogate) */
+.timeline-dot.holding::before {
+    content: '';
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: calc(var(--timeline-dot-size) + 8px);
+    height: calc(var(--timeline-dot-size) + 8px);
+    transform: translate(-50%, -50%);
+    border-radius: 50%;
+    box-shadow: 0 0 0 2px var(--timeline-dot-active-color) inset;
+    opacity: 0.15;
+    animation: timeline-hold-fade var(--timeline-hold-ms) linear forwards;
+    pointer-events: none;
+}
+
+@keyframes timeline-hold-fade {
+  from { opacity: 0.15; }
+  to   { opacity: 0.85; }
 }
 
 /* Floating tooltip element */
