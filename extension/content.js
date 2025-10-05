@@ -78,13 +78,16 @@ class TimelineManager {
         this.resizeIdleDelay = 140; // ms, settle time before min-gap correction
 
         this.debouncedRecalculateAndRender = this.debounce(this.recalculateAndRenderMarkers, 350);
+        this.persistFingerprintMapDebounced = this.debounce(() => this.persistFingerprintMap(false), 800);
 
         // Star/Highlight feature state
         this.starred = new Set();
         this.markerMap = new Map();
         this.conversationId = this.extractConversationIdFromPath(location.pathname);
         this.messageIdMap = new WeakMap();
-        this.syntheticIdCounter = 0;
+        this.fingerprintToTurnId = new Map();
+        this.fingerprintMapDirty = false;
+        this.fingerprintMapLimit = 1200;
         this.lastRoleGuess = 'assistant';
         // Long-press gesture state
         this.longPressDuration = 550; // ms
@@ -114,14 +117,16 @@ class TimelineManager {
     }
 
     async init() {
+        this.conversationId = this.extractConversationIdFromPath(location.pathname);
+        this.loadMessageIdMap();
+
         const elementsFound = await this.findCriticalElements();
         if (!elementsFound) return;
-        
+
         this.injectTimelineUI();
         this.setupEventListeners();
         this.setupObservers();
         // Load persisted star markers for current conversation
-        this.conversationId = this.extractConversationIdFromPath(location.pathname);
         this.loadStars();
         // Initial rendering will be triggered by observers; avoid duplicate delayed re-render
     }
@@ -251,7 +256,7 @@ class TimelineManager {
             if (role && !el.dataset.turn) {
                 el.dataset.turn = role;
             }
-            const id = this.ensureMessageId(el, i);
+            const id = this.ensureMessageId(el);
             if (id && !el.dataset.turnId) {
                 el.dataset.turnId = id;
             }
@@ -325,8 +330,230 @@ class TimelineManager {
         return null;
     }
 
-    ensureMessageId(el, index) {
+    extractTimestampText(el) {
+        if (!(el instanceof HTMLElement)) return '';
+        const attrCandidates = [
+            'data-timestamp',
+            'data-time',
+            'data-created-at',
+            'data-createdat',
+            'data-created',
+            'data-sent-at',
+            'data-sentat',
+            'data-msg-time',
+            'data-message-time'
+        ];
+        for (const attr of attrCandidates) {
+            const value = el.getAttribute(attr);
+            const normalized = this.normalizeTimestampValue(value);
+            if (normalized) return normalized;
+        }
+        if (el.dataset) {
+            const dataCandidates = [
+                el.dataset.timestamp,
+                el.dataset.time,
+                el.dataset.createdAt,
+                el.dataset.created,
+                el.dataset.createdat,
+                el.dataset.sentAt,
+                el.dataset.sentat,
+                el.dataset.msgTime,
+                el.dataset.messageTime
+            ];
+            for (const value of dataCandidates) {
+                const normalized = this.normalizeTimestampValue(value);
+                if (normalized) return normalized;
+            }
+        }
+
+        const selectors = [
+            'time[datetime]',
+            'time',
+            '[data-testid*="timestamp" i]',
+            '[data-testid*="time" i]',
+            '[class*="timestamp" i]',
+            '[class*="time" i]'
+        ];
+        for (const selector of selectors) {
+            const node = el.querySelector(selector);
+            if (!node) continue;
+            const candidates = [
+                node.getAttribute?.('datetime'),
+                node.getAttribute?.('data-time'),
+                node.getAttribute?.('aria-label'),
+                node.textContent
+            ];
+            for (const value of candidates) {
+                const normalized = this.normalizeTimestampValue(value);
+                if (normalized) return normalized;
+            }
+        }
+
+        let current = el;
+        for (let depth = 0; depth < 3 && current; depth++) {
+            const label = current.getAttribute?.('aria-label');
+            const normalized = this.normalizeTimestampValue(label);
+            if (normalized) return normalized;
+            current = current.parentElement;
+        }
+        return '';
+    }
+
+    normalizeTimestampValue(value) {
+        if (value == null) return '';
+        let raw = '';
+        try {
+            raw = String(value).trim();
+        } catch {
+            raw = '';
+        }
+        if (!raw) return '';
+        if (/^\d{13}$/.test(raw)) {
+            const ms = Number(raw);
+            if (Number.isFinite(ms)) {
+                const d = new Date(ms);
+                if (!Number.isNaN(d.getTime())) {
+                    try { return d.toISOString(); } catch {}
+                }
+            }
+        }
+        if (/^\d{10}$/.test(raw)) {
+            const seconds = Number(raw);
+            if (Number.isFinite(seconds)) {
+                const d = new Date(seconds * 1000);
+                if (!Number.isNaN(d.getTime())) {
+                    try { return d.toISOString(); } catch {}
+                }
+            }
+        }
+        return raw.replace(/\s+/g, ' ');
+    }
+
+    computeMessageFingerprint(el) {
         if (!(el instanceof HTMLElement)) return null;
+        const conversationKey = this.conversationId || this.extractConversationIdFromPath(location.pathname) || 'global';
+        let roleGuess = null;
+        if (el.dataset?.turn) {
+            roleGuess = this.normalizeRole(el.dataset.turn) || el.dataset.turn;
+        }
+        if (!roleGuess) {
+            roleGuess = this.readRoleFromAttributes(el);
+        }
+        if (!roleGuess) {
+            roleGuess = this.heuristicRole(el);
+        }
+        roleGuess = this.normalizeRole(roleGuess) || roleGuess || '';
+        const signature = this.buildMessageSignature(el);
+        const timestamp = this.extractTimestampText(el);
+        return JSON.stringify({ c: conversationKey, r: roleGuess || '', s: signature, t: timestamp || '' });
+    }
+
+    buildMessageSignature(el) {
+        if (!(el instanceof HTMLElement)) return '';
+        const textPieces = [];
+        const primaryText = this.normalizeText(el.textContent || '');
+        if (primaryText) textPieces.push(primaryText);
+        if (!primaryText) {
+            const aria = el.getAttribute('aria-label');
+            if (aria) {
+                const normalized = this.normalizeText(aria);
+                if (normalized) textPieces.push(normalized);
+            }
+        }
+        if (!textPieces.length) {
+            const codeNodes = el.querySelectorAll('code, pre');
+            if (codeNodes && codeNodes.length) {
+                let combined = '';
+                codeNodes.forEach(node => {
+                    combined += ` ${this.normalizeText(node.textContent || '')}`;
+                });
+                const normalized = this.normalizeText(combined);
+                if (normalized) textPieces.push(normalized);
+            }
+        }
+        let normalizedText = textPieces.join(' ').trim();
+        if (!normalizedText && el.innerHTML) {
+            try {
+                const stripped = String(el.innerHTML).replace(/<[^>]+>/g, ' ');
+                const fallback = this.normalizeText(stripped);
+                if (fallback) normalizedText = fallback;
+            } catch {}
+        }
+        const textHash = normalizedText ? this.hashString(normalizedText) : '';
+        const textLength = normalizedText ? normalizedText.length : 0;
+        const leadingHash = normalizedText ? this.hashString(normalizedText.slice(0, 160)) : '';
+        const html = el.innerHTML || '';
+        const htmlHash = html ? this.hashString(html) : '';
+        const outer = !htmlHash && el.outerHTML ? this.hashString(el.outerHTML) : '';
+        return [textHash, textLength, leadingHash, htmlHash || outer].join('|');
+    }
+
+    isTurnIdTaken(id, fingerprint) {
+        if (!id) return false;
+        for (const [fp, existingId] of this.fingerprintToTurnId.entries()) {
+            if (existingId === id && fp !== fingerprint) return true;
+        }
+        return false;
+    }
+
+    trimFingerprintMapIfNeeded() {
+        if (this.fingerprintToTurnId.size < this.fingerprintMapLimit) return;
+        const overflow = this.fingerprintToTurnId.size - this.fingerprintMapLimit + 1;
+        let removed = 0;
+        while (removed < overflow) {
+            const oldest = this.fingerprintToTurnId.keys().next();
+            if (oldest.done) break;
+            this.fingerprintToTurnId.delete(oldest.value);
+            removed++;
+        }
+        if (removed > 0) this.fingerprintMapDirty = true;
+    }
+
+    loadMessageIdMap() {
+        this.fingerprintToTurnId.clear();
+        this.fingerprintMapDirty = false;
+        const cid = this.conversationId;
+        if (!cid) return;
+        try {
+            const raw = localStorage.getItem(`deepseekTimelineMessageIds:${cid}`);
+            if (!raw) return;
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed)) {
+                for (const entry of parsed) {
+                    if (!Array.isArray(entry) || entry.length < 2) continue;
+                    const [fingerprint, id] = entry;
+                    if (typeof fingerprint === 'string' && typeof id === 'string') {
+                        this.fingerprintToTurnId.set(fingerprint, id);
+                    }
+                }
+            } else if (parsed && typeof parsed === 'object') {
+                for (const [fingerprint, id] of Object.entries(parsed)) {
+                    if (typeof fingerprint === 'string' && typeof id === 'string') {
+                        this.fingerprintToTurnId.set(fingerprint, id);
+                    }
+                }
+            }
+        } catch {}
+    }
+
+    persistFingerprintMap(force = false) {
+        if (!force && !this.fingerprintMapDirty) return;
+        const cid = this.conversationId;
+        if (!cid) return;
+        try {
+            const entries = Array.from(this.fingerprintToTurnId.entries());
+            if (entries.length > this.fingerprintMapLimit) {
+                const start = entries.length - this.fingerprintMapLimit;
+                entries.splice(0, start);
+            }
+            localStorage.setItem(`deepseekTimelineMessageIds:${cid}`, JSON.stringify(entries));
+            this.fingerprintMapDirty = false;
+        } catch {}
+    }
+
+    ensureMessageId(el) {
+        if (!(el instanceof HTMLElement)) return null;
+
         const attrCandidates = [
             'data-turn-id',
             'data-message-id',
@@ -341,6 +568,7 @@ class TimelineManager {
                 return value;
             }
         }
+
         if (el.dataset) {
             const dataCandidates = [el.dataset.turnId, el.dataset.messageId, el.dataset.msgId, el.dataset.id];
             for (const value of dataCandidates) {
@@ -350,14 +578,39 @@ class TimelineManager {
                 }
             }
         }
+
         if (this.messageIdMap.has(el)) {
             const cached = this.messageIdMap.get(el);
             if (!el.dataset.turnId) el.dataset.turnId = cached;
             return cached;
         }
-        const base = `${this.normalizeText(el.textContent || '').slice(0, 64)}|${index}|${++this.syntheticIdCounter}`;
-        const hashed = this.hashString(base);
-        const id = `ds-turn-${hashed}`;
+
+        const fingerprint = this.computeMessageFingerprint(el);
+        if (!fingerprint) return null;
+
+        let id = this.fingerprintToTurnId.get(fingerprint);
+        if (!id) {
+            const baseHash = this.hashString(fingerprint);
+            let candidate = `ds-turn-${baseHash}`;
+            if (this.isTurnIdTaken(candidate, fingerprint)) {
+                let suffix = 1;
+                while (suffix < 10) {
+                    const suffixHash = this.hashString(`${fingerprint}|${suffix}`);
+                    candidate = `ds-turn-${baseHash}-${suffixHash.slice(0, 4)}`;
+                    if (!this.isTurnIdTaken(candidate, fingerprint)) break;
+                    suffix++;
+                }
+                if (this.isTurnIdTaken(candidate, fingerprint)) {
+                    candidate = `ds-turn-${baseHash}-${Date.now().toString(36)}`;
+                }
+            }
+            id = candidate;
+            this.trimFingerprintMapIfNeeded();
+            this.fingerprintToTurnId.set(fingerprint, id);
+            this.fingerprintMapDirty = true;
+            this.persistFingerprintMapDebounced();
+        }
+
         this.messageIdMap.set(el, id);
         if (!el.dataset.turnId) el.dataset.turnId = id;
         return id;
@@ -1537,6 +1790,7 @@ class TimelineManager {
         try { this.resizeObserver?.disconnect(); } catch {}
         try { this.intersectionObserver?.disconnect(); } catch {}
         this.visibleUserTurns.clear();
+        this.persistFingerprintMap(true);
         if (this.ui.timelineBar && this.onTimelineBarClick) {
             try { this.ui.timelineBar.removeEventListener('click', this.onTimelineBarClick); } catch {}
         }
@@ -1597,6 +1851,8 @@ class TimelineManager {
         this.activeTurnId = null;
         this.scrollContainer = null;
         this.conversationContainer = null;
+        this.fingerprintToTurnId.clear();
+        this.fingerprintMapDirty = false;
         this.onTimelineBarClick = null;
         this.onTimelineBarOver = null;
         this.onTimelineBarOut = null;
