@@ -72,17 +72,23 @@ class TimelineManager {
         this.resizeIdleDelay = 140; // ms settle time before min-gap correction
         this.resizeIdleRICId = null; // requestIdleCallback id
         this.debugPerf = false;
-        try { this.debugPerf = (localStorage.getItem('chatgptTimelineDebugPerf') === '1'); } catch {}
+        try { this.debugPerf = (localStorage.getItem('deepseekTimelineDebugPerf') === '1'); } catch {}
         this.onVisualViewportResize = null;
         this.resizeIdleTimer = null;
         this.resizeIdleDelay = 140; // ms, settle time before min-gap correction
-        
+
         this.debouncedRecalculateAndRender = this.debounce(this.recalculateAndRenderMarkers, 350);
+        this.persistFingerprintMapDebounced = this.debounce(() => this.persistFingerprintMap(false), 800);
 
         // Star/Highlight feature state
         this.starred = new Set();
         this.markerMap = new Map();
         this.conversationId = this.extractConversationIdFromPath(location.pathname);
+        this.messageIdMap = new WeakMap();
+        this.fingerprintToTurnId = new Map();
+        this.fingerprintMapDirty = false;
+        this.fingerprintMapLimit = 1200;
+        this.lastRoleGuess = 'assistant';
         // Long-press gesture state
         this.longPressDuration = 550; // ms
         this.longPressMoveTolerance = 6; // px
@@ -111,43 +117,532 @@ class TimelineManager {
     }
 
     async init() {
+        this.conversationId = this.extractConversationIdFromPath(location.pathname);
+        this.loadMessageIdMap();
+
         const elementsFound = await this.findCriticalElements();
         if (!elementsFound) return;
-        
+
         this.injectTimelineUI();
         this.setupEventListeners();
         this.setupObservers();
         // Load persisted star markers for current conversation
-        this.conversationId = this.extractConversationIdFromPath(location.pathname);
         this.loadStars();
-        // Initial rendering will be triggered by observers; avoid duplicate delayed re-render
+        // Perform an initial render so the timeline populates even if no new
+        // mutations occur after we attach observers (e.g., when the page is
+        // already fully hydrated before our script runs).
+        this.recalculateAndRenderMarkers();
     }
     
     async findCriticalElements() {
-        const firstTurn = await this.waitForElement('article[data-turn-id]');
-        if (!firstTurn) return false;
-        
-        this.conversationContainer = firstTurn.parentElement;
-        if (!this.conversationContainer) return false;
+        const scroller = await this.waitForElement('.ds-scroll-area, [data-radix-scroll-area-viewport], [class*="scroll-area"]');
+        if (!scroller) return false;
 
-        let parent = this.conversationContainer;
-        while (parent && parent !== document.body) {
-            const style = window.getComputedStyle(parent);
+        let scrollCandidate = scroller;
+        let probe = scroller;
+        while (probe && probe !== document.body) {
+            const style = window.getComputedStyle(probe);
             if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
-                this.scrollContainer = parent;
+                scrollCandidate = probe;
                 break;
             }
-            parent = parent.parentElement;
+            probe = probe.parentElement;
         }
-        return this.scrollContainer !== null;
+
+        this.scrollContainer = scrollCandidate;
+        this.conversationContainer = this.resolveConversationContainer(scrollCandidate);
+        if (!this.conversationContainer) this.conversationContainer = scroller;
+
+        this.annotateAllMessages();
+        return true;
+    }
+
+    resolveConversationContainer(scroller) {
+        if (!scroller || !(scroller instanceof HTMLElement)) return null;
+        const selectors = [
+            '[data-message-list]',
+            '[data-testid="chat-message-list"]',
+            '[role="list"]',
+            '[class*="message-list"]',
+            '[class*="conversation"]',
+            '[class*="chat-list"]'
+        ];
+        for (const selector of selectors) {
+            const candidate = scroller.querySelector(selector);
+            if (candidate instanceof HTMLElement) return candidate;
+        }
+        if (scroller.firstElementChild instanceof HTMLElement) {
+            return scroller.firstElementChild;
+        }
+        return scroller;
+    }
+
+    collectPotentialMessageNodes() {
+        if (!this.conversationContainer) return [];
+        const container = this.conversationContainer;
+        const selectors = [
+            '[data-message-id]',
+            '[data-msg-id]',
+            '[data-role]',
+            '[data-author]',
+            '[data-author-role]',
+            '[data-sender]',
+            '[data-message-author]',
+            '[data-qa="message"]',
+            '[class*="message"]',
+            '[class*="bubble"]',
+            '[class*="chat-item"]',
+            '[class*="conversation-item"]',
+            '[class*="ds-msg"]'
+        ];
+        const candidates = [];
+        const seen = new Set();
+        const pushCandidate = (el) => {
+            if (!(el instanceof HTMLElement)) return;
+            if (seen.has(el)) return;
+            if (!this.isEligibleMessageNode(el)) return;
+            candidates.push(el);
+            seen.add(el);
+        };
+
+        for (const selector of selectors) {
+            const found = Array.from(container.querySelectorAll(selector));
+            if (found.length) {
+                found.forEach(pushCandidate);
+                if (candidates.length >= 2) break;
+            }
+        }
+
+        if (!candidates.length) {
+            Array.from(container.children).forEach(pushCandidate);
+        }
+
+        return this.pruneNestedMessageNodes(candidates);
+    }
+
+    pruneNestedMessageNodes(nodes) {
+        const filtered = [];
+        for (let i = 0; i < nodes.length; i++) {
+            const node = nodes[i];
+            let isNested = false;
+            for (let j = 0; j < nodes.length; j++) {
+                if (i === j) continue;
+                const other = nodes[j];
+                if (other.contains(node)) {
+                    isNested = true;
+                    break;
+                }
+            }
+            if (!isNested) filtered.push(node);
+        }
+        return filtered;
+    }
+
+    isEligibleMessageNode(el) {
+        if (!(el instanceof HTMLElement)) return false;
+        if (el.closest('.timeline-track, .timeline-tooltip, .timeline-left-slider')) return false;
+        const role = this.readRoleFromAttributes(el);
+        if (role) return true;
+        const text = this.normalizeText(el.textContent || '');
+        if (text.length > 0) return true;
+        if (el.querySelector('pre, code, img, math, svg')) return true;
+        return false;
+    }
+
+    annotateAllMessages() {
+        const nodes = this.collectPotentialMessageNodes();
+        if (!nodes.length) return;
+        const roles = this.inferRoles(nodes);
+        for (let i = 0; i < nodes.length; i++) {
+            const el = nodes[i];
+            const role = roles[i];
+            if (role && !el.dataset.turn) {
+                el.dataset.turn = role;
+            }
+            const id = this.ensureMessageId(el);
+            if (id && !el.dataset.turnId) {
+                el.dataset.turnId = id;
+            }
+        }
+        if (roles.length) {
+            this.lastRoleGuess = roles[roles.length - 1] || this.lastRoleGuess;
+        }
+    }
+
+    inferRoles(nodes) {
+        const roles = new Array(nodes.length).fill(null);
+        let lastRole = this.lastRoleGuess || 'assistant';
+        for (let i = 0; i < nodes.length; i++) {
+            const el = nodes[i];
+            let role = this.readRoleFromAttributes(el);
+            if (!role) role = this.heuristicRole(el);
+            if (!role) {
+                role = (lastRole === 'user') ? 'assistant' : 'user';
+            }
+            roles[i] = role;
+            lastRole = role;
+            if (!el.dataset.turn && role) el.dataset.turn = role;
+        }
+        return roles;
+    }
+
+    readRoleFromAttributes(el) {
+        if (!(el instanceof HTMLElement)) return null;
+        const attrCandidates = [
+            'data-role',
+            'data-author',
+            'data-author-role',
+            'data-message-role',
+            'data-sender',
+            'data-message-author',
+            'aria-label'
+        ];
+        for (const attr of attrCandidates) {
+            const value = el.getAttribute(attr);
+            const role = this.normalizeRole(value);
+            if (role) return role;
+        }
+        if (el.dataset) {
+            const dataCandidates = [el.dataset.role, el.dataset.author, el.dataset.authorRole, el.dataset.messageRole, el.dataset.sender];
+            for (const value of dataCandidates) {
+                const role = this.normalizeRole(value);
+                if (role) return role;
+            }
+        }
+        const classRole = this.normalizeRole(Array.from(el.classList || []).join(' '));
+        if (classRole) return classRole;
+        return null;
+    }
+
+    normalizeRole(value) {
+        if (!value) return null;
+        const lower = String(value).toLowerCase();
+        if (/(^|\W)(user|me|human|customer)(\W|$)/.test(lower)) return 'user';
+        if (/(^|\W)(assistant|bot|ai|system|deepseek)(\W|$)/.test(lower)) return 'assistant';
+        return null;
+    }
+
+    heuristicRole(el) {
+        if (!(el instanceof HTMLElement)) return null;
+        if (el.querySelector('button[aria-label*="copy" i], button[data-clipboard], button[aria-label*="复制"]')) {
+            return 'assistant';
+        }
+        const alignment = window.getComputedStyle(el).textAlign;
+        if (alignment === 'right') return 'user';
+        if (alignment === 'left') return 'assistant';
+        return null;
+    }
+
+    extractTimestampText(el) {
+        if (!(el instanceof HTMLElement)) return '';
+        const attrCandidates = [
+            'data-timestamp',
+            'data-time',
+            'data-created-at',
+            'data-createdat',
+            'data-created',
+            'data-sent-at',
+            'data-sentat',
+            'data-msg-time',
+            'data-message-time'
+        ];
+        for (const attr of attrCandidates) {
+            const value = el.getAttribute(attr);
+            const normalized = this.normalizeTimestampValue(value);
+            if (normalized) return normalized;
+        }
+        if (el.dataset) {
+            const dataCandidates = [
+                el.dataset.timestamp,
+                el.dataset.time,
+                el.dataset.createdAt,
+                el.dataset.created,
+                el.dataset.createdat,
+                el.dataset.sentAt,
+                el.dataset.sentat,
+                el.dataset.msgTime,
+                el.dataset.messageTime
+            ];
+            for (const value of dataCandidates) {
+                const normalized = this.normalizeTimestampValue(value);
+                if (normalized) return normalized;
+            }
+        }
+
+        const selectors = [
+            'time[datetime]',
+            'time',
+            '[data-testid*="timestamp" i]',
+            '[data-testid*="time" i]',
+            '[class*="timestamp" i]',
+            '[class*="time" i]'
+        ];
+        for (const selector of selectors) {
+            const node = el.querySelector(selector);
+            if (!node) continue;
+            const candidates = [
+                node.getAttribute?.('datetime'),
+                node.getAttribute?.('data-time'),
+                node.getAttribute?.('aria-label'),
+                node.textContent
+            ];
+            for (const value of candidates) {
+                const normalized = this.normalizeTimestampValue(value);
+                if (normalized) return normalized;
+            }
+        }
+
+        let current = el;
+        for (let depth = 0; depth < 3 && current; depth++) {
+            const label = current.getAttribute?.('aria-label');
+            const normalized = this.normalizeTimestampValue(label);
+            if (normalized) return normalized;
+            current = current.parentElement;
+        }
+        return '';
+    }
+
+    normalizeTimestampValue(value) {
+        if (value == null) return '';
+        let raw = '';
+        try {
+            raw = String(value).trim();
+        } catch {
+            raw = '';
+        }
+        if (!raw) return '';
+        if (/^\d{13}$/.test(raw)) {
+            const ms = Number(raw);
+            if (Number.isFinite(ms)) {
+                const d = new Date(ms);
+                if (!Number.isNaN(d.getTime())) {
+                    try { return d.toISOString(); } catch {}
+                }
+            }
+        }
+        if (/^\d{10}$/.test(raw)) {
+            const seconds = Number(raw);
+            if (Number.isFinite(seconds)) {
+                const d = new Date(seconds * 1000);
+                if (!Number.isNaN(d.getTime())) {
+                    try { return d.toISOString(); } catch {}
+                }
+            }
+        }
+        return raw.replace(/\s+/g, ' ');
+    }
+
+    computeMessageFingerprint(el) {
+        if (!(el instanceof HTMLElement)) return null;
+        const conversationKey = this.conversationId || this.extractConversationIdFromPath(location.pathname) || 'global';
+        let roleGuess = null;
+        if (el.dataset?.turn) {
+            roleGuess = this.normalizeRole(el.dataset.turn) || el.dataset.turn;
+        }
+        if (!roleGuess) {
+            roleGuess = this.readRoleFromAttributes(el);
+        }
+        if (!roleGuess) {
+            roleGuess = this.heuristicRole(el);
+        }
+        roleGuess = this.normalizeRole(roleGuess) || roleGuess || '';
+        const signature = this.buildMessageSignature(el);
+        const timestamp = this.extractTimestampText(el);
+        return JSON.stringify({ c: conversationKey, r: roleGuess || '', s: signature, t: timestamp || '' });
+    }
+
+    buildMessageSignature(el) {
+        if (!(el instanceof HTMLElement)) return '';
+        const textPieces = [];
+        const primaryText = this.normalizeText(el.textContent || '');
+        if (primaryText) textPieces.push(primaryText);
+        if (!primaryText) {
+            const aria = el.getAttribute('aria-label');
+            if (aria) {
+                const normalized = this.normalizeText(aria);
+                if (normalized) textPieces.push(normalized);
+            }
+        }
+        if (!textPieces.length) {
+            const codeNodes = el.querySelectorAll('code, pre');
+            if (codeNodes && codeNodes.length) {
+                let combined = '';
+                codeNodes.forEach(node => {
+                    combined += ` ${this.normalizeText(node.textContent || '')}`;
+                });
+                const normalized = this.normalizeText(combined);
+                if (normalized) textPieces.push(normalized);
+            }
+        }
+        let normalizedText = textPieces.join(' ').trim();
+        if (!normalizedText && el.innerHTML) {
+            try {
+                const stripped = String(el.innerHTML).replace(/<[^>]+>/g, ' ');
+                const fallback = this.normalizeText(stripped);
+                if (fallback) normalizedText = fallback;
+            } catch {}
+        }
+        const textHash = normalizedText ? this.hashString(normalizedText) : '';
+        const textLength = normalizedText ? normalizedText.length : 0;
+        const leadingHash = normalizedText ? this.hashString(normalizedText.slice(0, 160)) : '';
+        const html = el.innerHTML || '';
+        const htmlHash = html ? this.hashString(html) : '';
+        const outer = !htmlHash && el.outerHTML ? this.hashString(el.outerHTML) : '';
+        return [textHash, textLength, leadingHash, htmlHash || outer].join('|');
+    }
+
+    isTurnIdTaken(id, fingerprint) {
+        if (!id) return false;
+        for (const [fp, existingId] of this.fingerprintToTurnId.entries()) {
+            if (existingId === id && fp !== fingerprint) return true;
+        }
+        return false;
+    }
+
+    trimFingerprintMapIfNeeded() {
+        if (this.fingerprintToTurnId.size < this.fingerprintMapLimit) return;
+        const overflow = this.fingerprintToTurnId.size - this.fingerprintMapLimit + 1;
+        let removed = 0;
+        while (removed < overflow) {
+            const oldest = this.fingerprintToTurnId.keys().next();
+            if (oldest.done) break;
+            this.fingerprintToTurnId.delete(oldest.value);
+            removed++;
+        }
+        if (removed > 0) this.fingerprintMapDirty = true;
+    }
+
+    loadMessageIdMap() {
+        this.fingerprintToTurnId.clear();
+        this.fingerprintMapDirty = false;
+        const cid = this.conversationId;
+        if (!cid) return;
+        try {
+            const raw = localStorage.getItem(`deepseekTimelineMessageIds:${cid}`);
+            if (!raw) return;
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed)) {
+                for (const entry of parsed) {
+                    if (!Array.isArray(entry) || entry.length < 2) continue;
+                    const [fingerprint, id] = entry;
+                    if (typeof fingerprint === 'string' && typeof id === 'string') {
+                        this.fingerprintToTurnId.set(fingerprint, id);
+                    }
+                }
+            } else if (parsed && typeof parsed === 'object') {
+                for (const [fingerprint, id] of Object.entries(parsed)) {
+                    if (typeof fingerprint === 'string' && typeof id === 'string') {
+                        this.fingerprintToTurnId.set(fingerprint, id);
+                    }
+                }
+            }
+        } catch {}
+    }
+
+    persistFingerprintMap(force = false) {
+        if (!force && !this.fingerprintMapDirty) return;
+        const cid = this.conversationId;
+        if (!cid) return;
+        try {
+            const entries = Array.from(this.fingerprintToTurnId.entries());
+            if (entries.length > this.fingerprintMapLimit) {
+                const start = entries.length - this.fingerprintMapLimit;
+                entries.splice(0, start);
+            }
+            localStorage.setItem(`deepseekTimelineMessageIds:${cid}`, JSON.stringify(entries));
+            this.fingerprintMapDirty = false;
+        } catch {}
+    }
+
+    ensureMessageId(el) {
+        if (!(el instanceof HTMLElement)) return null;
+
+        const attrCandidates = [
+            'data-turn-id',
+            'data-message-id',
+            'data-msg-id',
+            'data-id',
+            'id'
+        ];
+        for (const attr of attrCandidates) {
+            const value = el.getAttribute(attr);
+            if (value) {
+                if (!el.dataset.turnId) el.dataset.turnId = value;
+                return value;
+            }
+        }
+
+        if (el.dataset) {
+            const dataCandidates = [el.dataset.turnId, el.dataset.messageId, el.dataset.msgId, el.dataset.id];
+            for (const value of dataCandidates) {
+                if (value) {
+                    if (!el.dataset.turnId) el.dataset.turnId = value;
+                    return value;
+                }
+            }
+        }
+
+        if (this.messageIdMap.has(el)) {
+            const cached = this.messageIdMap.get(el);
+            if (!el.dataset.turnId) el.dataset.turnId = cached;
+            return cached;
+        }
+
+        const fingerprint = this.computeMessageFingerprint(el);
+        if (!fingerprint) return null;
+
+        let id = this.fingerprintToTurnId.get(fingerprint);
+        if (!id) {
+            const baseHash = this.hashString(fingerprint);
+            let candidate = `ds-turn-${baseHash}`;
+            if (this.isTurnIdTaken(candidate, fingerprint)) {
+                let suffix = 1;
+                while (suffix < 10) {
+                    const suffixHash = this.hashString(`${fingerprint}|${suffix}`);
+                    candidate = `ds-turn-${baseHash}-${suffixHash.slice(0, 4)}`;
+                    if (!this.isTurnIdTaken(candidate, fingerprint)) break;
+                    suffix++;
+                }
+                if (this.isTurnIdTaken(candidate, fingerprint)) {
+                    candidate = `ds-turn-${baseHash}-${Date.now().toString(36)}`;
+                }
+            }
+            id = candidate;
+            this.trimFingerprintMapIfNeeded();
+            this.fingerprintToTurnId.set(fingerprint, id);
+            this.fingerprintMapDirty = true;
+            this.persistFingerprintMapDebounced();
+        }
+
+        this.messageIdMap.set(el, id);
+        if (!el.dataset.turnId) el.dataset.turnId = id;
+        return id;
+    }
+
+    hashString(input) {
+        let hash = 0;
+        const str = String(input || '');
+        for (let i = 0; i < str.length; i++) {
+            hash = (hash * 31 + str.charCodeAt(i)) >>> 0;
+        }
+        return hash.toString(36);
+    }
+
+    getCommitId() {
+        try {
+            const meta = document.querySelector('meta[name="commit-id"]');
+            return meta?.content || '';
+        } catch {
+            return '';
+        }
     }
     
     injectTimelineUI() {
         // Idempotent: ensure bar exists, then ensure track + content exist
-        let timelineBar = document.querySelector('.chatgpt-timeline-bar');
+        let timelineBar = document.querySelector('.deepseek-timeline-bar');
         if (!timelineBar) {
             timelineBar = document.createElement('div');
-            timelineBar.className = 'chatgpt-timeline-bar';
+            timelineBar.className = 'deepseek-timeline-bar';
             document.body.appendChild(timelineBar);
         }
         this.ui.timelineBar = timelineBar;
@@ -183,7 +678,7 @@ class TimelineManager {
             const tip = document.createElement('div');
             tip.className = 'timeline-tooltip';
             tip.setAttribute('role', 'tooltip');
-            tip.id = 'chatgpt-timeline-tooltip';
+            tip.id = 'deepseek-timeline-tooltip';
             document.body.appendChild(tip);
             this.ui.tooltip = tip;
             // Hidden measurement node for legacy DOM truncation (fallback)
@@ -229,7 +724,8 @@ class TimelineManager {
         this.perfStart('recalc');
         if (!this.conversationContainer || !this.ui.timelineBar || !this.scrollContainer) return;
 
-        const userTurnElements = this.conversationContainer.querySelectorAll('article[data-turn="user"]');
+        this.annotateAllMessages();
+        const userTurnElements = this.conversationContainer.querySelectorAll('[data-turn="user"]');
         // Reset visible window to avoid cleaning with stale indices after rebuild
         this.visibleRange = { start: 0, end: -1 };
         // If the conversation is transiently empty (branch switching), don't wipe UI immediately
@@ -336,12 +832,13 @@ class TimelineManager {
 
     // Ensure our conversation/scroll containers are still current after DOM replacements
     ensureContainersUpToDate() {
-        const first = document.querySelector('article[data-turn-id]');
-        if (!first) return;
-        const newConv = first.parentElement;
+        if (!this.scrollContainer) return;
+        const newConv = this.resolveConversationContainer(this.scrollContainer);
         if (newConv && newConv !== this.conversationContainer) {
             // Rebind observers and listeners to the new conversation root
             this.rebindConversationContainer(newConv);
+        } else {
+            this.annotateAllMessages();
         }
     }
 
@@ -354,6 +851,7 @@ class TimelineManager {
         try { this.intersectionObserver?.disconnect(); } catch {}
 
         this.conversationContainer = newConv;
+        this.annotateAllMessages();
 
         // Find (or re-find) scroll container
         let parent = newConv;
@@ -393,7 +891,8 @@ class TimelineManager {
         if (!this.intersectionObserver || !this.conversationContainer) return;
         this.intersectionObserver.disconnect();
         this.visibleUserTurns.clear();
-        const userTurns = this.conversationContainer.querySelectorAll('article[data-turn="user"][data-turn-id]');
+        this.annotateAllMessages();
+        const userTurns = this.conversationContainer.querySelectorAll('[data-turn="user"][data-turn-id]');
         userTurns.forEach(el => this.intersectionObserver.observe(el));
     }
 
@@ -407,7 +906,8 @@ class TimelineManager {
                     return;
                 }
                 const targetId = dot.dataset.targetTurnId;
-                const targetElement = this.conversationContainer.querySelector(`article[data-turn-id="${targetId}"]`);
+                const marker = targetId ? this.markerMap.get(targetId) : null;
+                const targetElement = marker?.element || this.conversationContainer.querySelector(`[data-turn-id="${targetId}"]`);
                 if (targetElement) {
                     // Only scroll; let scroll-based computation set active to avoid double-flash
                     this.smoothScrollTo(targetElement);
@@ -577,7 +1077,7 @@ class TimelineManager {
                 if (!e || e.storageArea !== localStorage) return;
                 const cid = this.conversationId;
                 if (!cid) return;
-                const expectedKey = `chatgptTimelineStars:${cid}`;
+                const expectedKey = `deepseekTimelineStars:${cid}`;
                 if (e.key !== expectedKey) return;
 
                 // Parse new star set
@@ -1013,7 +1513,7 @@ class TimelineManager {
                 dot.dataset.targetTurnId = marker.id;
                 dot.setAttribute('aria-label', marker.summary);
                 dot.setAttribute('tabindex', '0');
-                try { dot.setAttribute('aria-describedby', 'chatgpt-timeline-tooltip'); } catch {}
+                try { dot.setAttribute('aria-describedby', 'deepseek-timeline-tooltip'); } catch {}
                 try { dot.style.setProperty('--n', String(marker.n || 0)); } catch {}
                 if (this.usePixelTop) {
                     dot.style.top = `${Math.round(this.yPositions[i])}px`;
@@ -1293,6 +1793,7 @@ class TimelineManager {
         try { this.resizeObserver?.disconnect(); } catch {}
         try { this.intersectionObserver?.disconnect(); } catch {}
         this.visibleUserTurns.clear();
+        this.persistFingerprintMap(true);
         if (this.ui.timelineBar && this.onTimelineBarClick) {
             try { this.ui.timelineBar.removeEventListener('click', this.onTimelineBarClick); } catch {}
         }
@@ -1353,6 +1854,8 @@ class TimelineManager {
         this.activeTurnId = null;
         this.scrollContainer = null;
         this.conversationContainer = null;
+        this.fingerprintToTurnId.clear();
+        this.fingerprintMapDirty = false;
         this.onTimelineBarClick = null;
         this.onTimelineBarOver = null;
         this.onTimelineBarOut = null;
@@ -1383,15 +1886,22 @@ class TimelineManager {
     }
 
     // --- Star/Highlight helpers ---
-    extractConversationIdFromPath(pathname = location.pathname) {
+    extractConversationIdFromPath(pathname = location.pathname, search = location.search) {
         try {
-            const segs = String(pathname || '').split('/').filter(Boolean);
-            const i = segs.indexOf('c');
-            if (i === -1) return null;
-            const slug = segs[i + 1];
-            if (slug && /^[A-Za-z0-9_-]+$/.test(slug)) return slug;
+            const pathStr = String(pathname || '');
+            const searchStr = String(search || '');
+            const directMatch = pathStr.match(/(?:chat|conversation)s?\/([A-Za-z0-9_-]{4,})(?:\/?|$)/i);
+            if (directMatch && directMatch[1]) return directMatch[1];
+
+            const queryMatch = searchStr.match(/[?&](?:conv|conversation|chat)_?id=([A-Za-z0-9_-]+)/i);
+            if (queryMatch && queryMatch[1]) return queryMatch[1];
+
+            const href = `${location.origin || ''}${pathStr}${searchStr}`;
+            const fallbackSeed = `${href}|${document.title || ''}|${this.getCommitId()}`;
+            return `ds-${this.hashString(fallbackSeed)}`;
+        } catch {
             return null;
-        } catch { return null; }
+        }
     }
 
     loadStars() {
@@ -1399,7 +1909,7 @@ class TimelineManager {
         const cid = this.conversationId;
         if (!cid) return;
         try {
-            const raw = localStorage.getItem(`chatgptTimelineStars:${cid}`);
+            const raw = localStorage.getItem(`deepseekTimelineStars:${cid}`);
             if (!raw) return;
             const arr = JSON.parse(raw);
             if (Array.isArray(arr)) arr.forEach(id => this.starred.add(String(id)));
@@ -1409,7 +1919,7 @@ class TimelineManager {
     saveStars() {
         const cid = this.conversationId;
         if (!cid) return;
-        try { localStorage.setItem(`chatgptTimelineStars:${cid}`, JSON.stringify(Array.from(this.starred))); } catch {}
+        try { localStorage.setItem(`deepseekTimelineStars:${cid}`, JSON.stringify(Array.from(this.starred))); } catch {}
     }
 
     toggleStar(turnId) {
@@ -1450,14 +1960,11 @@ let routeCheckIntervalId = null;   // lightweight href polling fallback
 let routeListenersAttached = false;
 
 // Accept both /c/<id> and nested routes like /g/.../c/<id>
-function isConversationRoute(pathname = location.pathname) {
-  // Split path into segments and ensure there's an independent "c" segment
-  const segs = pathname.split('/').filter(Boolean);
-  const i = segs.indexOf('c');
-  if (i === -1) return false;           // no "c" segment → not a conversation route
-  const slug = segs[i + 1];             // the segment right after "c" must exist
-  // Lightweight validity check: allow letters/digits/_/-
-  return typeof slug === 'string' && slug.length > 0 && /^[A-Za-z0-9_-]+$/.test(slug);
+function isConversationRoute() {
+    const host = String(location.hostname || '').toLowerCase();
+    if (!host.includes('deepseek')) return false;
+    if (host.includes('chat.')) return true;
+    return Boolean(document.querySelector('.ds-scroll-area, [data-radix-scroll-area-viewport]'));
 }
 
 function attachRouteListenersOnce() {
@@ -1492,9 +1999,9 @@ function initializeTimeline() {
         timelineManagerInstance = null;
     }
     // Remove any leftover UI before creating a new instance
-    try { document.querySelector('.chatgpt-timeline-bar')?.remove(); } catch {}
+    try { document.querySelector('.deepseek-timeline-bar')?.remove(); } catch {}
     try { document.querySelector('.timeline-left-slider')?.remove(); } catch {}
-    try { document.getElementById('chatgpt-timeline-tooltip')?.remove(); } catch {}
+    try { document.getElementById('deepseek-timeline-tooltip')?.remove(); } catch {}
     timelineManagerInstance = new TimelineManager();
     timelineManagerInstance.init().catch(err => console.error("Timeline initialization failed:", err));
  }
@@ -1517,15 +2024,15 @@ function handleUrlChange() {
             try { timelineManagerInstance.destroy(); } catch {}
             timelineManagerInstance = null;
         }
-        try { document.querySelector('.chatgpt-timeline-bar')?.remove(); } catch {}
+        try { document.querySelector('.deepseek-timeline-bar')?.remove(); } catch {}
         try { document.querySelector('.timeline-left-slider')?.remove(); } catch {}
-        try { document.getElementById('chatgpt-timeline-tooltip')?.remove(); } catch {}
+        try { document.getElementById('deepseek-timeline-tooltip')?.remove(); } catch {}
         cleanupGlobalObservers();
     }
 }
 
 const initialObserver = new MutationObserver(() => {
-    if (document.querySelector('article[data-turn-id]')) {
+    if (document.querySelector('.ds-scroll-area, [data-radix-scroll-area-viewport], [data-turn-id]')) {
         if (isConversationRoute()) {
             initializeTimeline();
         }
