@@ -128,7 +128,10 @@ class TimelineManager {
         this.setupObservers();
         // Load persisted star markers for current conversation
         this.loadStars();
-        // Initial rendering will be triggered by observers; avoid duplicate delayed re-render
+        // Perform an initial render so the timeline populates even if no new
+        // mutations occur after we attach observers (e.g., when the page is
+        // already fully hydrated before our script runs).
+        this.recalculateAndRenderMarkers();
     }
     
     async findCriticalElements() {
